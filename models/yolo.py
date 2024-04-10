@@ -558,7 +558,7 @@ class DetectionModel(BaseModel):
             self.stride = m.stride
             m.bias_init()  # only run once
         if isinstance(m, (DualDetect, TripleDetect, DualDDetect, TripleDDetect)):
-            s = 256  # 2x min stride
+            s = 256 #256  # 2x min stride
             m.inplace = self.inplace
             #forward = lambda x: self.forward(x)[0][0] if isinstance(m, (DualSegment)) else self.forward(x)[0]
             forward = lambda x: self.forward(x)[0]
@@ -675,9 +675,9 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
 
         n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
         if m in {
-            Conv, AConv, ConvTranspose, 
+            Conv, AConv, ConvTranspose, RepNCSPELAN4_TF,
             Bottleneck, SPP, SPPF, DWConv, BottleneckCSP, nn.ConvTranspose2d, DWConvTranspose2d, SPPCSPC, ADown,
-            RepNCSPELAN4, SPPELAN}:
+            RepNCSPELAN4, RepNCSPELAN4_EMA1, RepNCSPELAN4_EMA2, SPPELAN}:
             c1, c2 = ch[f], args[0]
             if c2 != no:  # if not output
                 c2 = make_divisible(c2 * gw, 8)
@@ -688,7 +688,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
                 n = 1
         elif m is nn.BatchNorm2d:
             args = [ch[f]]
-        elif m is Concat:
+        elif m in {Concat, Concat_TF}:
             c2 = sum(ch[x] for x in f)
         elif m is Shortcut:
             c2 = ch[f[0]]

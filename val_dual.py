@@ -157,7 +157,7 @@ def run(
                                        batch_size,
                                        stride,
                                        single_cls,
-                                       pad=pad,
+                                       # pad=pad,
                                        rect=rect,
                                        workers=workers,
                                        min_items=opt.min_items,
