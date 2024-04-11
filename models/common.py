@@ -1154,11 +1154,13 @@ class RepNCSPELAN4_TF(nn.Module):
 
         n, c, h, w = x.shape
         src_flatten = x.flatten(2).transpose(1, 2)
-        if self.eval_size is not None and not self.training:
-            pos_embed = self.pos_embed
-        else:
-            pos_embed = self.build_2d_sincos_position_embedding(
-                w=w, h=h, embed_dim=self.hidden_dim).to(x.device)
+        # if self.eval_size is not None and not self.training:
+        #     pos_embed = self.pos_embed
+        # else:
+        #     pos_embed = self.build_2d_sincos_position_embedding(
+        #         w=w, h=h, embed_dim=self.hidden_dim).to(x.device)
+        pos_embed = self.build_2d_sincos_position_embedding(
+            w=w, h=h, embed_dim=self.hidden_dim).to(x.device)
         memory = self.encoder(src_flatten,pos_embed=pos_embed.to(src_flatten.device))
         memory = memory.transpose(1, 2).reshape([n, c, h, w])
         if self.res:
