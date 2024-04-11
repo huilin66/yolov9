@@ -754,9 +754,10 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
 
         n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
         if m in {
-            Conv, AConv, ConvTranspose, 
+            Conv, AConv, GSConv, GSConvD, ConvTranspose,
             Bottleneck, SPP, SPPF, DWConv, BottleneckCSP, nn.ConvTranspose2d, DWConvTranspose2d, SPPCSPC, ADown,
-            RepNCSPELAN4, SPPELAN}:
+            RepNCSPELAN4, RepNCSPELAN4_TF, RepNCSPELAN4_EMA1, RepNCSPELAN4_EMA2, RepNCSPELAN4_EMA3,
+            SPPELAN, SPPELAN_TFd}:
             c1, c2 = ch[f], args[0]
             if c2 != no:  # if not output
                 c2 = make_divisible(c2 * gw, 8)
