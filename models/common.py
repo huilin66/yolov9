@@ -57,6 +57,32 @@ class Conv(nn.Module):
         return self.act(self.conv(x))
 
 
+class GSConv(nn.Module):
+    # GSConv https://github.com/AlanLi1997/slim-neck-by-gsconv
+    def __init__(self, c1, c2, k=3, s=1, g=1, act=True):
+        super().__init__()
+        c_ = c2 // 2
+        self.cv1 = Conv(c1, c_, k, s, None, g, act=act)
+        self.cv2 = Conv(c_, c_, 5, 1, None, c_, act=act)
+
+    def forward(self, x):
+        x1 = self.cv1(x)
+        x2 = torch.cat((x1, self.cv2(x1)), 1)
+
+        # shuffle
+        # y = x2.reshape(x2.shape[0], 2, x2.shape[1] // 2, x2.shape[2], x2.shape[3])
+        # y = y.permute(0, 2, 1, 3, 4)
+        # return y.reshape(y.shape[0], -1, y.shape[3], y.shape[4])
+
+        b, n, h, w = x2.data.size()         # b, n, h, w
+        b_n = b * n // 2
+        y = x2.reshape(b_n, 2, h * w)       # b*n/2, 2, h*w
+        y = y.permute(1, 0, 2)              # 2, b*n/2, h*w
+        y = y.reshape(2, -1, n // 2, h, w)  # 2, b, n//2, h, w
+
+        return torch.cat((y[0], y[1]), 1)   # b, n, h, w
+
+
 class AConv(nn.Module):
     def __init__(self, c1, c2):  # ch_in, ch_out, shortcut, kernels, groups, expand
         super().__init__()
@@ -1325,6 +1351,44 @@ class RepNCSPELAN4_EMA2(nn.Module):
             y = self.ema(y)
         return y
 
+
+class RepNCSPELAN4_EMA3(nn.Module):
+    # csp-elan
+    def __init__(self, c1, c2, c3, c4, c5=1, ema_pos=4):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+        self.c = c3//2
+        self.cv1 = Conv(c1, c3, 1, 1)
+        self.cv2 = nn.Sequential(RepNCSP(c3//2, c4, c5), Conv(c4, c4, 3, 1))
+        self.cv3 = nn.Sequential(RepNCSP(c4, c4, c5), Conv(c4, c4, 3, 1))
+        self.cv4 = Conv(c3+(2*c4), c2, 1, 1)
+        self.ema_pos = ema_pos
+        if self.ema_pos==4:
+            self.ema = EMA2(c1)
+        elif self.ema_pos==5:
+            self.ema = EMA2(c2)
+
+
+    def forward(self, x):
+        if self.ema_pos==4:
+            x = self.ema(x)
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend((m(y[-1])) for m in [self.cv2, self.cv3])
+        y = self.cv4(torch.cat(y, 1))
+        if self.ema_pos==5:
+            y = self.ema(y)
+        return y
+
+    def forward_split(self, x):
+        if self.ema_pos==4:
+            x = self.ema(x)
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y.extend(m(y[-1]) for m in [self.cv2, self.cv3])
+        y = self.cv4(torch.cat(y, 1))
+        if self.ema_pos==5:
+            y = self.ema(y)
+        return y
+
+
 class RepNCSPELAN4_TF(nn.Module):
     # csp-elan
     def __init__(self, c1, c2, c3, c4, c5=1,
@@ -1573,6 +1637,39 @@ class EMA2(nn.Module):
         x22 = x1.reshape(b * self.groups, c // self.groups, -1)  # b*g, c//g, hw
         weights = (torch.matmul(x11, x12) + torch.matmul(x21, x22)).reshape(b * self.groups, 1, h, w)
         return (group_x * weights.sigmoid()).reshape(b, c, h, w)+x
+
+
+class EMA3(nn.Module):
+    def __init__(self, channels, c2=None, factor=32):
+        super(EMA3, self).__init__()
+        self.groups = factor
+        assert channels // self.groups > 0
+        self.softmax = nn.Softmax(-1)
+        self.agp = nn.AdaptiveAvgPool2d((1, 1))
+        # self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        # self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        self.gn = nn.GroupNorm(channels // self.groups, channels // self.groups)
+        self.conv1x1 = nn.Conv2d(channels // self.groups, channels // self.groups, kernel_size=1, stride=1, padding=0)
+        self.conv3x3 = GSConv(channels // self.groups, channels // self.groups, k=3, s=1)
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+        group_x = x.reshape(b * self.groups, -1, h, w)  # b*g,c//g,h,w
+        # x_h = self.pool_h(group_x)
+        # x_w = self.pool_w(group_x).permute(0, 1, 3, 2)
+        x_h = torch.mean(group_x, dim=-1, keepdim=True)
+        x_w = torch.mean(group_x, dim=-2, keepdim=True).permute(0, 1, 3, 2)
+        hw = self.conv1x1(torch.cat([x_h, x_w], dim=2))
+        x_h, x_w = torch.split(hw, [h, w], dim=2)
+        x1 = self.gn(group_x * x_h.sigmoid() * x_w.permute(0, 1, 3, 2).sigmoid())
+        x2 = self.conv3x3(group_x)
+        x11 = self.softmax(self.agp(x1).reshape(b * self.groups, -1, 1).permute(0, 2, 1))
+        x12 = x2.reshape(b * self.groups, c // self.groups, -1)  # b*g, c//g, hw
+        x21 = self.softmax(self.agp(x2).reshape(b * self.groups, -1, 1).permute(0, 2, 1))
+        x22 = x1.reshape(b * self.groups, c // self.groups, -1)  # b*g, c//g, hw
+        weights = (torch.matmul(x11, x12) + torch.matmul(x21, x22)).reshape(b * self.groups, 1, h, w)
+        return (group_x * weights.sigmoid()).reshape(b, c, h, w)+x
+
 
 #################
 
