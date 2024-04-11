@@ -57,32 +57,6 @@ class Conv(nn.Module):
         return self.act(self.conv(x))
 
 
-class GSConv(nn.Module):
-    # GSConv https://github.com/AlanLi1997/slim-neck-by-gsconv
-    def __init__(self, c1, c2, k=3, s=1, g=1, act=True):
-        super().__init__()
-        c_ = c2 // 2
-        self.cv1 = Conv(c1, c_, k, s, None, g, act=act)
-        self.cv2 = Conv(c_, c_, 5, 1, None, c_, act=act)
-
-    def forward(self, x):
-        x1 = self.cv1(x)
-        x2 = torch.cat((x1, self.cv2(x1)), 1)
-
-        # shuffle
-        # y = x2.reshape(x2.shape[0], 2, x2.shape[1] // 2, x2.shape[2], x2.shape[3])
-        # y = y.permute(0, 2, 1, 3, 4)
-        # return y.reshape(y.shape[0], -1, y.shape[3], y.shape[4])
-
-        b, n, h, w = x2.data.size()         # b, n, h, w
-        b_n = b * n // 2
-        y = x2.reshape(b_n, 2, h * w)       # b*n/2, 2, h*w
-        y = y.permute(1, 0, 2)              # 2, b*n/2, h*w
-        y = y.reshape(2, -1, n // 2, h, w)  # 2, b, n//2, h, w
-
-        return torch.cat((y[0], y[1]), 1)   # b, n, h, w
-
-
 class AConv(nn.Module):
     def __init__(self, c1, c2):  # ch_in, ch_out, shortcut, kernels, groups, expand
         super().__init__()
@@ -92,6 +66,38 @@ class AConv(nn.Module):
         x = torch.nn.functional.avg_pool2d(x, 2, 1, 0, False, True)
         return self.cv1(x)
 
+class GSADown(nn.Module):
+    def __init__(self, c1, c2, gs_pos=1):  # ch_in, ch_out, shortcut, kernels, groups, expand
+        super().__init__()
+        self.c = c2 // 2
+        self.cv1 = Conv(c1 // 2, self.c, 3, 2, 1)
+        self.cv2 = Conv(c1 // 2, self.c, 1, 1, 0)
+        self.gs_pos = gs_pos
+        if self.gs_pos == 1:
+            self.gsconv = GSConv(c1, c1)
+        elif self.gs_pos == 2:
+            self.gsconv = nn.ModuleList([
+                GSConv(self.c, self.c),
+                GSConv(self.c, self.c),
+                ])
+        elif self.gs_pos == 3:
+            self.gsconv = GSConv(c2, c2)
+
+    def forward(self, x):
+        if self.gs_pos == 1:
+            x = self.gsconv(x)
+        x = torch.nn.functional.avg_pool2d(x, 2, 1, 0, False, True)
+        x1,x2 = x.chunk(2, 1)
+        x1 = self.cv1(x1)
+        x2 = torch.nn.functional.max_pool2d(x2, 3, 2, 1)
+        x2 = self.cv2(x2)
+        if self.gs_pos == 2:
+            x1 = self.gsconv[0](x1)
+            x2 = self.gsconv[0](x2)
+        y = torch.cat((x1, x2), 1)
+        if self.gs_pos == 3:
+            y = self.gsconv(y)
+        return y
 
 class ADown(nn.Module):
     def __init__(self, c1, c2):  # ch_in, ch_out, shortcut, kernels, groups, expand
@@ -1038,105 +1044,6 @@ class SPPELAN_TFd(nn.Module):
     def forward(self, x):
         n, c, h, w = x.shape
         src_flatten = x.flatten(2).transpose(1, 2)
-        # if self.eval_size is not None and not self.training:
-        #     pos_embed = self.pos_embed
-        # else:
-        #     pos_embed = self.build_2d_sincos_position_embedding(
-        #         w=w, h=h, embed_dim=self.hidden_dim).to(x.device)
-        pos_embed = self.build_2d_sincos_position_embedding(
-            w=w, h=h, embed_dim=self.hidden_dim).to(x.device)
-        memory = self.encoder(src_flatten,pos_embed=pos_embed.to(src_flatten.device))
-        memory = memory.transpose(1, 2).reshape([n, c, h, w])
-        memory = self.drop(self.act(memory))
-        if self.res:
-            x = x + memory
-        else:
-            x = memory
-
-        y = [self.cv1(x)]
-        y.extend(m(y[-1]) for m in [self.cv2, self.cv3, self.cv4])
-        return self.cv5(torch.cat(y, 1))
-
-
-class SPPELAN_TFd_EMA1(nn.Module):
-    # spp-elan
-    def __init__(self, c1, c2, c3,
-                 ema_pos=1,
-                 res=False,
-                 eval_size=[640, 640],
-                 dim_feedforward=2048,
-                 dropout=0.1,
-                 activation='gelu',
-                 nhead=4,
-                 num_layers=4,
-                 attn_dropout=None,
-                 act_dropout=None,
-                 normalize_before=False,
-                 ):  # ch_in, ch_out, number, shortcut, groups, expansion
-        super().__init__()
-        self.c = c3
-        self.cv1 = Conv(c1, c3, 1, 1)
-        self.cv2 = SP(5)
-        self.cv3 = SP(5)
-        self.cv4 = SP(5)
-        self.cv5 = Conv(4*c3, c2, 1, 1)
-
-        self.ema_pos = ema_pos
-        if self.ema_pos==1:
-            self.ema = EMA1(512)
-        elif self.ema_pos==2:
-            self.ema = EMA1(c1)
-        elif self.ema_pos==3:
-            self.ema = EMA1(c3)
-        self.res = res
-        self.eval_size = eval_size
-        self.hidden_dim=512
-        self.pos_embed = self.build_2d_sincos_position_embedding(
-            20,
-            20,
-            embed_dim=self.hidden_dim)
-
-        encoder_layer = TransformerEncoderLayer(
-            self.hidden_dim, nhead, dim_feedforward, dropout, activation,
-            attn_dropout, act_dropout, normalize_before)
-        encoder_norm = nn.LayerNorm(
-            self.hidden_dim) if normalize_before else None
-        self.encoder = TransformerEncoder(encoder_layer, num_layers,
-                                          encoder_norm)
-        self.act = nn.GELU()
-        self.drop = nn.Dropout(dropout)
-
-    def build_2d_sincos_position_embedding(
-            self,
-            w,
-            h,
-            embed_dim=1024,
-            temperature=10000., ):
-        grid_w = torch.arange(int(w), dtype=torch.float32)
-        grid_h = torch.arange(int(h), dtype=torch.float32)
-        grid_w, grid_h = torch.meshgrid(grid_w, grid_h)
-        assert embed_dim % 4 == 0, 'Embed dimension must be divisible by 4 for 2D sin-cos position embedding'
-        pos_dim = embed_dim // 4
-        omega = torch.arange(pos_dim, dtype=torch.float32) / pos_dim
-        omega = 1. / (temperature**omega)
-
-        out_w = grid_w.flatten()[..., None] @omega[None]
-        out_h = grid_h.flatten()[..., None] @omega[None]
-
-        pos_emb = torch.concat(
-            [
-                torch.sin(out_w), torch.cos(out_w), torch.sin(out_h),
-                torch.cos(out_h)
-            ],
-            axis=1)[None, :, :]
-
-        return pos_emb
-
-    def forward(self, x):
-        n, c, h, w = x.shape
-        if self.ema_pos==1:
-            x = self.ema(x)
-        src_flatten = x.flatten(2).transpose(1, 2)
         if self.eval_size is not None and not self.training:
             pos_embed = self.pos_embed
         else:
@@ -1149,112 +1056,8 @@ class SPPELAN_TFd_EMA1(nn.Module):
             x = x + memory
         else:
             x = memory
-        if self.ema_pos==2:
-            x = self.ema(x)
 
         y = [self.cv1(x)]
-        if self.ema_pos==3:
-            y[0] = self.ema(y[0])
-        y.extend(m(y[-1]) for m in [self.cv2, self.cv3, self.cv4])
-        return self.cv5(torch.cat(y, 1))
-
-class SPPELAN_TFd_EMA2(nn.Module):
-    # spp-elan
-    def __init__(self, c1, c2, c3,
-                 ema_pos=1,
-                 res=False,
-                 eval_size=[640, 640],
-                 dim_feedforward=2048,
-                 dropout=0.1,
-                 activation='gelu',
-                 nhead=4,
-                 num_layers=4,
-                 attn_dropout=None,
-                 act_dropout=None,
-                 normalize_before=False,
-                 ):  # ch_in, ch_out, number, shortcut, groups, expansion
-        super().__init__()
-        self.c = c3
-        self.cv1 = Conv(c1, c3, 1, 1)
-        self.cv2 = SP(5)
-        self.cv3 = SP(5)
-        self.cv4 = SP(5)
-        self.cv5 = Conv(4*c3, c2, 1, 1)
-
-        self.ema_pos = ema_pos
-        if self.ema_pos==1:
-            self.ema = EMA2(512)
-        elif self.ema_pos==2:
-            self.ema = EMA2(c1)
-        elif self.ema_pos==3:
-            self.ema = EMA2(c3)
-        self.res = res
-        self.eval_size = eval_size
-        self.hidden_dim=512
-        self.pos_embed = self.build_2d_sincos_position_embedding(
-            20,
-            20,
-            embed_dim=self.hidden_dim)
-
-        encoder_layer = TransformerEncoderLayer(
-            self.hidden_dim, nhead, dim_feedforward, dropout, activation,
-            attn_dropout, act_dropout, normalize_before)
-        encoder_norm = nn.LayerNorm(
-            self.hidden_dim) if normalize_before else None
-        self.encoder = TransformerEncoder(encoder_layer, num_layers,
-                                          encoder_norm)
-        self.act = nn.GELU()
-        self.drop = nn.Dropout(dropout)
-
-    def build_2d_sincos_position_embedding(
-            self,
-            w,
-            h,
-            embed_dim=1024,
-            temperature=10000., ):
-        grid_w = torch.arange(int(w), dtype=torch.float32)
-        grid_h = torch.arange(int(h), dtype=torch.float32)
-        grid_w, grid_h = torch.meshgrid(grid_w, grid_h)
-        assert embed_dim % 4 == 0, 'Embed dimension must be divisible by 4 for 2D sin-cos position embedding'
-        pos_dim = embed_dim // 4
-        omega = torch.arange(pos_dim, dtype=torch.float32) / pos_dim
-        omega = 1. / (temperature**omega)
-
-        out_w = grid_w.flatten()[..., None] @omega[None]
-        out_h = grid_h.flatten()[..., None] @omega[None]
-
-        pos_emb = torch.concat(
-            [
-                torch.sin(out_w), torch.cos(out_w), torch.sin(out_h),
-                torch.cos(out_h)
-            ],
-            axis=1)[None, :, :]
-
-        return pos_emb
-
-    def forward(self, x):
-        n, c, h, w = x.shape
-        if self.ema_pos==1:
-            x = self.ema(x)
-        src_flatten = x.flatten(2).transpose(1, 2)
-        if self.eval_size is not None and not self.training:
-            pos_embed = self.pos_embed
-        else:
-            pos_embed = self.build_2d_sincos_position_embedding(
-                w=w, h=h, embed_dim=self.hidden_dim).to(x.device)
-        memory = self.encoder(src_flatten,pos_embed=pos_embed.to(src_flatten.device))
-        memory = memory.transpose(1, 2).reshape([n, c, h, w])
-        memory = self.drop(self.act(memory))
-        if self.res:
-            x = x + memory
-        else:
-            x = memory
-        if self.ema_pos==2:
-            x = self.ema(x)
-
-        y = [self.cv1(x)]
-        if self.ema_pos==3:
-            y[0] = self.ema(y[0])
         y.extend(m(y[-1]) for m in [self.cv2, self.cv3, self.cv4])
         return self.cv5(torch.cat(y, 1))
 
@@ -1279,6 +1082,319 @@ class RepNCSPELAN4(nn.Module):
         y.extend(m(y[-1]) for m in [self.cv2, self.cv3])
         return self.cv4(torch.cat(y, 1))
 
+class RepNCSPELAN4_TF(nn.Module):
+    # csp-elan
+    def __init__(self, c1, c2, c3, c4, c5=1,
+                 res=False,
+                 eval_size=[640, 640],
+                 dim_feedforward=2048,
+                 dropout=0.1,
+                 activation='gelu',
+                 nhead=4,
+                 num_layers=4,
+                 attn_dropout=None,
+                 act_dropout=None,
+                 normalize_before=False,
+                 ):  # ch_in, ch_out, number, shortcut, groups, expansion
+        super().__init__()
+        self.c = c3//2
+        self.cv1 = Conv(c1, c3, 1, 1)
+        self.cv2 = nn.Sequential(RepNCSP(c3//2, c4, c5), Conv(c4, c4, 3, 1))
+        self.cv3 = nn.Sequential(RepNCSP(c4, c4, c5), Conv(c4, c4, 3, 1))
+        self.cv4 = Conv(c3+(2*c4), c2, 1, 1)
+
+        self.res = res
+        self.eval_size = eval_size
+        self.hidden_dim=512
+        self.pos_embed = self.build_2d_sincos_position_embedding(
+            20,
+            20,
+            embed_dim=self.hidden_dim)
+
+        encoder_layer = TransformerEncoderLayer(
+            self.hidden_dim, nhead, dim_feedforward, dropout, activation,
+            attn_dropout, act_dropout, normalize_before)
+        encoder_norm = nn.LayerNorm(
+            self.hidden_dim) if normalize_before else None
+        self.encoder = TransformerEncoder(encoder_layer, num_layers,
+                                          encoder_norm)
+
+    def build_2d_sincos_position_embedding(
+            self,
+            w,
+            h,
+            embed_dim=1024,
+            temperature=10000., ):
+        grid_w = torch.arange(int(w), dtype=torch.float32)
+        grid_h = torch.arange(int(h), dtype=torch.float32)
+        grid_w, grid_h = torch.meshgrid(grid_w, grid_h)
+        assert embed_dim % 4 == 0, 'Embed dimension must be divisible by 4 for 2D sin-cos position embedding'
+        pos_dim = embed_dim // 4
+        omega = torch.arange(pos_dim, dtype=torch.float32) / pos_dim
+        omega = 1. / (temperature**omega)
+
+        out_w = grid_w.flatten()[..., None] @omega[None]
+        out_h = grid_h.flatten()[..., None] @omega[None]
+
+        pos_emb = torch.concat(
+            [
+                torch.sin(out_w), torch.cos(out_w), torch.sin(out_h),
+                torch.cos(out_h)
+            ],
+            axis=1)[None, :, :]
+
+        return pos_emb
+
+    def forward(self, x):
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend((m(y[-1])) for m in [self.cv2, self.cv3])
+        x = self.cv4(torch.cat(y, 1))
+
+        n, c, h, w = x.shape
+        src_flatten = x.flatten(2).transpose(1, 2)
+        if self.eval_size is not None and not self.training:
+            pos_embed = self.pos_embed
+        else:
+            pos_embed = self.build_2d_sincos_position_embedding(
+                w=w, h=h, embed_dim=self.hidden_dim).to(x.device)
+        memory = self.encoder(src_flatten,pos_embed=pos_embed.to(src_flatten.device))
+        memory = memory.transpose(1, 2).reshape([n, c, h, w])
+        if self.res:
+            x = x + memory
+        else:
+            x = memory
+        return x
+
+    def forward_split(self, x):
+        y = list(self.cv1(x).split((self.c, self.c), 1))
+        y.extend(m(y[-1]) for m in [self.cv2, self.cv3])
+        x = self.cv4(torch.cat(y, 1))
+
+        n, c, h, w = x.shape
+        src_flatten = x.flatten(2).transpose(1, 2)
+        if self.eval_size is not None and not self.training:
+            pos_embed = self.pos_embed
+        else:
+            pos_embed = self.build_2d_sincos_position_embedding(
+                w=w, h=h, embed_dim=self.hidden_dim).to(x.device)
+        memory = self.encoder(src_flatten,pos_embed=pos_embed.to(src_flatten.device))
+        memory = memory.transpose(1, 2).reshape([n, c, h, w])
+        if self.res:
+            x = x + memory
+        else:
+            x = memory
+        return x
+
+class Concat_TF(nn.Module):
+    # Concatenate a list of tensors along dimension
+    def __init__(self, dimension,
+                 res=False,
+                 eval_size=[640, 640],
+                 dim_feedforward=2048,
+                 dropout=0.1,
+                 activation='gelu',
+                 nhead=4,
+                 num_layers=4,
+                 attn_dropout=None,
+                 act_dropout=None,
+                 normalize_before=False,
+                 ):
+        super().__init__()
+        self.d = dimension
+        self.res = res
+        self.eval_size = eval_size
+        self.hidden_dim=512
+        self.pos_embed = self.build_2d_sincos_position_embedding(
+            20,
+            20,
+            embed_dim=self.hidden_dim)
+
+        encoder_layer = TransformerEncoderLayer(
+            self.hidden_dim, nhead, dim_feedforward, dropout, activation,
+            attn_dropout, act_dropout, normalize_before)
+        encoder_norm = nn.LayerNorm(
+            self.hidden_dim) if normalize_before else None
+        self.encoder = TransformerEncoder(encoder_layer, num_layers,
+                                          encoder_norm)
+
+    def build_2d_sincos_position_embedding(
+            self,
+            w,
+            h,
+            embed_dim=1024,
+            temperature=10000., ):
+        grid_w = torch.arange(int(w), dtype=torch.float32)
+        grid_h = torch.arange(int(h), dtype=torch.float32)
+        grid_w, grid_h = torch.meshgrid(grid_w, grid_h)
+        assert embed_dim % 4 == 0, 'Embed dimension must be divisible by 4 for 2D sin-cos position embedding'
+        pos_dim = embed_dim // 4
+        omega = torch.arange(pos_dim, dtype=torch.float32) / pos_dim
+        omega = 1. / (temperature**omega)
+
+        out_w = grid_w.flatten()[..., None] @omega[None]
+        out_h = grid_h.flatten()[..., None] @omega[None]
+
+        pos_emb = torch.concat(
+            [
+                torch.sin(out_w), torch.cos(out_w), torch.sin(out_h),
+                torch.cos(out_h)
+            ],
+            axis=1)[None, :, :]
+
+        return pos_emb
+
+    def forward(self, xs):
+        x1, x = xs
+        n, c, h, w = x.shape
+        src_flatten = x.flatten(2).transpose(1, 2)
+        # if self.eval_size is not None and not self.training:
+        #     pos_embed = self.pos_embed
+        # else:
+        #     pos_embed = self.build_2d_sincos_position_embedding(
+        #         w=w, h=h, embed_dim=self.hidden_dim).to(x.device)
+        pos_embed = self.build_2d_sincos_position_embedding(
+            w=w, h=h, embed_dim=self.hidden_dim).to(x.device)
+        memory = self.encoder(src_flatten,pos_embed=pos_embed.to(src_flatten.device))
+        memory = memory.transpose(1, 2).reshape([n, c, h, w])
+        if self.res:
+            x = x + memory
+        else:
+            x = memory
+        xs = [x1, x]
+        return torch.cat(xs, self.d)
+
+
+class TFd(nn.Module):
+    # Concatenate a list of tensors along dimension
+    def __init__(self,
+                 res=False,
+                 eval_size=[640, 640],
+                 dim_feedforward=2048,
+                 dropout=0.1,
+                 activation='gelu',
+                 nhead=4,
+                 num_layers=4,
+                 attn_dropout=None,
+                 act_dropout=None,
+                 normalize_before=False,
+                 ):
+        super().__init__()
+        self.res = res
+        self.eval_size = eval_size
+        self.hidden_dim=512
+        self.pos_embed = self.build_2d_sincos_position_embedding(
+            20,
+            20,
+            embed_dim=self.hidden_dim)
+
+        encoder_layer = TransformerEncoderLayer(
+            self.hidden_dim, nhead, dim_feedforward, dropout, activation,
+            attn_dropout, act_dropout, normalize_before)
+        encoder_norm = nn.LayerNorm(
+            self.hidden_dim) if normalize_before else None
+        self.encoder = TransformerEncoder(encoder_layer, num_layers,
+                                          encoder_norm)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+
+    def build_2d_sincos_position_embedding(
+            self,
+            w,
+            h,
+            embed_dim=1024,
+            temperature=10000., ):
+        grid_w = torch.arange(int(w), dtype=torch.float32)
+        grid_h = torch.arange(int(h), dtype=torch.float32)
+        grid_w, grid_h = torch.meshgrid(grid_w, grid_h)
+        assert embed_dim % 4 == 0, 'Embed dimension must be divisible by 4 for 2D sin-cos position embedding'
+        pos_dim = embed_dim // 4
+        omega = torch.arange(pos_dim, dtype=torch.float32) / pos_dim
+        omega = 1. / (temperature**omega)
+
+        out_w = grid_w.flatten()[..., None] @omega[None]
+        out_h = grid_h.flatten()[..., None] @omega[None]
+
+        pos_emb = torch.concat(
+            [
+                torch.sin(out_w), torch.cos(out_w), torch.sin(out_h),
+                torch.cos(out_h)
+            ],
+            axis=1)[None, :, :]
+
+        return pos_emb
+
+    def forward(self, x):
+        n, c, h, w = x.shape
+        src_flatten = x.flatten(2).transpose(1, 2)
+        # if self.eval_size is not None and not self.training:
+        #     pos_embed = self.pos_embed
+        # else:
+        #     pos_embed = self.build_2d_sincos_position_embedding(
+        #         w=w, h=h, embed_dim=self.hidden_dim).to(x.device)
+        pos_embed = self.build_2d_sincos_position_embedding(
+            w=w, h=h, embed_dim=self.hidden_dim).to(x.device)
+        memory = self.encoder(src_flatten,pos_embed=pos_embed.to(src_flatten.device))
+        memory = memory.transpose(1, 2).reshape([n, c, h, w])
+        memory = self.drop(self.act(memory))
+        if self.res:
+            x = x + memory
+        else:
+            x = memory
+        return x
+
+
+class GSConv(nn.Module):
+    # GSConv https://github.com/AlanLi1997/slim-neck-by-gsconv
+    def __init__(self, c1, c2, k=3, s=1, g=1, act=True):
+        super().__init__()
+        c_ = c2 // 2
+        self.cv1 = Conv(c1, c_, k, s, None, g, act=act)
+        self.cv2 = Conv(c_, c_, 5, 1, None, c_, act=act)
+
+    def forward(self, x):
+        x1 = self.cv1(x)
+        x2 = torch.cat((x1, self.cv2(x1)), 1)
+
+        # shuffle
+        # y = x2.reshape(x2.shape[0], 2, x2.shape[1] // 2, x2.shape[2], x2.shape[3])
+        # y = y.permute(0, 2, 1, 3, 4)
+        # return y.reshape(y.shape[0], -1, y.shape[3], y.shape[4])
+
+        b, n, h, w = x2.data.size()         # b, n, h, w
+        b_n = b * n // 2
+        y = x2.reshape(b_n, 2, h * w)       # b*n/2, 2, h*w
+        y = y.permute(1, 0, 2)              # 2, b*n/2, h*w
+        y = y.reshape(2, -1, n // 2, h, w)  # 2, b, n//2, h, w
+
+        return torch.cat((y[0], y[1]), 1)   # b, n, h, w
+
+class GSConvD(nn.Module):
+    # GSConv https://github.com/AlanLi1997/slim-neck-by-gsconv
+    def __init__(self, c1, c2, k=3, s=1, g=1, act=True, dropout=0.1):
+        super().__init__()
+        c_ = c2 // 2
+        self.cv1 = Conv(c1, c_, k, s, None, g, act=act)
+        self.cv2 = Conv(c_, c_, 5, 1, None, c_, act=act)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x1 = self.cv1(x)
+        # x1 = self.drop(self.act(x1))
+        x2 = torch.cat((x1, self.cv2(x1)), 1)
+        # x2 = self.drop(self.act(x2))
+        # shuffle
+        y = x2.reshape(x2.shape[0], 2, x2.shape[1] // 2, x2.shape[2], x2.shape[3])
+        y = y.permute(0, 2, 1, 3, 4)
+        return y.reshape(y.shape[0], -1, y.shape[3], y.shape[4])
+
+        b, n, h, w = x2.data.size()
+        b_n = b * n // 2
+        y = x2.reshape(b_n, 2, h * w)
+        y = y.permute(1, 0, 2)
+        y = y.reshape(2, -1, n // 2, h, w)
+
+        return torch.cat((y[0], y[1]), 1)
 
 class RepNCSPELAN4_EMA1(nn.Module):
     # csp-elan

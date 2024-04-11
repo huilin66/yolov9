@@ -256,6 +256,85 @@ class DualDDetect(nn.Module):
             b[-1].bias.data[:m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (5 objects and 80 classes per 640 image)
 
 
+class DualD2SingleDetect(nn.Module):
+    # YOLO Detect head for detection models
+    dynamic = False  # force grid reconstruction
+    export = False  # export mode
+    shape = None
+    anchors = torch.empty(0)  # init
+    strides = torch.empty(0)  # init
+
+    def __init__(self, nc=80, ch=(), fuse_method='mean', inplace=True):  # detection layer
+        super().__init__()
+        self.nc = nc  # number of classes
+        self.nl = len(ch) // 2  # number of detection layers
+        self.reg_max = 16
+        self.no = nc + self.reg_max * 4  # number of outputs per anchor
+        self.inplace = inplace  # use inplace ops (e.g. slice assignment)
+        self.stride = torch.zeros(self.nl)  # strides computed during build
+
+        c2, c3 = make_divisible(max((ch[0] // 4, self.reg_max * 4, 16)), 4), max((ch[0], min((self.nc * 2, 128))))  # channels
+        c4, c5 = make_divisible(max((ch[self.nl] // 4, self.reg_max * 4, 16)), 4), max((ch[self.nl], min((self.nc * 2, 128))))  # channels
+        self.cv2 = nn.ModuleList(
+            nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3, g=4), nn.Conv2d(c2, 4 * self.reg_max, 1, groups=4)) for x in ch[:self.nl])
+        self.cv3 = nn.ModuleList(
+            nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch[:self.nl])
+        self.cv4 = nn.ModuleList(
+            nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3, g=4), nn.Conv2d(c4, 4 * self.reg_max, 1, groups=4)) for x in ch[self.nl:])
+        self.cv5 = nn.ModuleList(
+            nn.Sequential(Conv(x, c5, 3), Conv(c5, c5, 3), nn.Conv2d(c5, self.nc, 1)) for x in ch[self.nl:])
+        self.dfl = DFL(self.reg_max)
+        self.dfl2 = DFL(self.reg_max)
+        self.fuse_method = fuse_method
+
+    def forward(self, x):
+        shape = x[0].shape  # BCHW
+        d1 = []
+        d2 = []
+        for i in range(self.nl):
+            d1.append(torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1))
+            d2.append(torch.cat((self.cv4[i](x[self.nl+i]), self.cv5[i](x[self.nl+i])), 1))
+
+        if self.fuse_method == 'mean':
+            d = [torch.mean(torch.cat([f1.unsqueeze(0), f2.unsqueeze(0)], dim=0), dim=0) for f1,f2 in zip(d1, d2)]
+        else:
+            d = [torch.max(torch.cat([f1.unsqueeze(0), f2.unsqueeze(0)], dim=0), dim=0) for f1, f2 in zip(d1, d2)]
+        if self.training:
+            return d
+        elif self.dynamic or self.shape != shape:
+            self.anchors, self.strides = (d1.transpose(0, 1) for d1 in make_anchors(d1, self.stride, 0.5))
+            self.shape = shape
+
+        box, cls = torch.cat([di.view(shape[0], self.no, -1) for di in d1], 2).split((self.reg_max * 4, self.nc), 1)
+        dbox = dist2bbox(self.dfl(box), self.anchors.unsqueeze(0), xywh=True, dim=1) * self.strides
+        box2, cls2 = torch.cat([di.view(shape[0], self.no, -1) for di in d2], 2).split((self.reg_max * 4, self.nc), 1)
+        dbox2 = dist2bbox(self.dfl2(box2), self.anchors.unsqueeze(0), xywh=True, dim=1) * self.strides
+        # y = [torch.cat((dbox, cls.sigmoid()), 1), torch.cat((dbox2, cls2.sigmoid()), 1)]
+        # return y if self.export else (y, [d1, d2])
+
+        y = [torch.cat((dbox, cls.sigmoid()), 1), torch.cat((dbox2, cls2.sigmoid()), 1)]
+        return y if self.export else (y, d)
+        #y = torch.cat((dbox2, cls2.sigmoid()), 1)
+        #return y if self.export else (y, d2)
+        #y1 = torch.cat((dbox, cls.sigmoid()), 1)
+        #y2 = torch.cat((dbox2, cls2.sigmoid()), 1)
+        #return [y1, y2] if self.export else [(y1, d1), (y2, d2)]
+        #return [y1, y2] if self.export else [(y1, y2), (d1, d2)]
+
+    def bias_init(self):
+        # Initialize Detect() biases, WARNING: requires stride availability
+        m = self  # self.model[-1]  # Detect() module
+        # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
+        # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
+        for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
+            a[-1].bias.data[:] = 1.0  # box
+            b[-1].bias.data[:m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (5 objects and 80 classes per 640 image)
+        for a, b, s in zip(m.cv4, m.cv5, m.stride):  # from
+            a[-1].bias.data[:] = 1.0  # box
+            b[-1].bias.data[:m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (5 objects and 80 classes per 640 image)
+
+
+
 class TripleDetect(nn.Module):
     # YOLO Detect head for detection models
     dynamic = False  # force grid reconstruction
@@ -548,7 +627,7 @@ class DetectionModel(BaseModel):
 
         # Build strides, anchors
         m = self.model[-1]  # Detect()
-        if isinstance(m, (Detect, DDetect, Segment)):
+        if isinstance(m, (Detect, DDetect, DualD2SingleDetect, Segment)):
             s = 256  # 2x min stride
             m.inplace = self.inplace
             forward = lambda x: self.forward(x)[0] if isinstance(m, (Segment)) else self.forward(x)
@@ -675,9 +754,9 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
 
         n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
         if m in {
-            Conv, AConv, ConvTranspose, RepNCSPELAN4_TF,
+            Conv, AConv, ConvTranspose, 
             Bottleneck, SPP, SPPF, DWConv, BottleneckCSP, nn.ConvTranspose2d, DWConvTranspose2d, SPPCSPC, ADown,
-            RepNCSPELAN4, RepNCSPELAN4_EMA1, RepNCSPELAN4_EMA2, SPPELAN}:
+            RepNCSPELAN4, SPPELAN}:
             c1, c2 = ch[f], args[0]
             if c2 != no:  # if not output
                 c2 = make_divisible(c2 * gw, 8)
@@ -701,7 +780,8 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         elif m is CBFuse:
             c2 = ch[f[-1]]
         # TODO: channel, gw, gd
-        elif m in {Detect, DualDetect, TripleDetect, DDetect, DualDDetect, TripleDDetect, Segment}:
+        elif m in {Detect, DualDetect, TripleDetect, DDetect, DualDDetect, TripleDDetect, Segment,
+                   DualD2SingleDetect}:
             args.append([ch[x] for x in f])
             # if isinstance(args[1], int):  # number of anchors
             #     args[1] = [list(range(args[1] * 2))] * len(f)

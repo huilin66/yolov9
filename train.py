@@ -16,6 +16,8 @@ import yaml
 from torch.optim import lr_scheduler
 from tqdm import tqdm
 
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # root directory
 if str(ROOT) not in sys.path:
@@ -207,7 +209,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                        rect=True,
                                        rank=-1,
                                        workers=workers * 2,
-                                       pad=0.5,
+                                       # pad=0.5,
                                        prefix=colorstr('val: '))[0]
 
         if not resume:
